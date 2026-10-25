@@ -70,6 +70,16 @@ static BOOL immediateMessagePayloadDelivery = NO;
             [[FirebasexCorePlugin sharedInstance] _logInfo:@"Firebase Cloud Messaging is disabled, see IOS_FCM_ENABLED variable of the plugin"];
         }
 
+        // cordova-ios 8: the core plugin's +load swizzle of
+        // application:didFinishLaunchingWithOptions: does not take effect, so
+        // FirebasexAppDidFinishLaunching is never posted and the delegates are never
+        // installed. Make sure both the core launch setup and our delegate setup ran.
+        id appDelegate = [UIApplication sharedApplication].delegate;
+        if ([appDelegate isKindOfClass:[CDVAppDelegate class]]) {
+            [(CDVAppDelegate *)appDelegate firebasexCoreEnsureLaunched];
+            [(CDVAppDelegate *)appDelegate firebasexMessagingSetup];
+        }
+
         // Set actionable categories if pn-actions.json exist in bundle
         [self setActionableNotifications];
 

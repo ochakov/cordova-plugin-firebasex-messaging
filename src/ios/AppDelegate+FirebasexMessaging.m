@@ -37,6 +37,8 @@ NSString *const FirebasexNotificationSettings = @"FirebasexNotificationSettings"
 static __weak id<UNUserNotificationCenterDelegate> _prevUserNotificationCenterDelegate = nil;
 /** Temporary mutable copy of notification userInfo for processing. */
 static NSDictionary *mutableUserInfo;
+/** Set once the delegates have been installed (from the launch notification or from pluginInitialize). */
+static BOOL messagingSetupDone = NO;
 
 @implementation CDVAppDelegate (FirebasexMessaging)
 
@@ -61,6 +63,10 @@ static NSDictionary *mutableUserInfo;
  * Preserves any previously set UNUserNotificationCenterDelegate for forwarding.
  */
 - (void)firebasexMessagingSetup {
+    if (messagingSetupDone) {
+        return;
+    }
+    messagingSetupDone = YES;
     @try {
         [FirebasexCorePlugin.sharedInstance initFirebase];
         if ([self firebasexMessagingIsFCMEnabled]) {
@@ -230,10 +236,12 @@ static NSDictionary *mutableUserInfo;
                         messageType = [messageData objectForKey:@"messageType"];
                     }
 
-                    NSDictionary *userInfo = [[NSDictionary alloc]
-                        initWithObjectsAndKeys:@"true", @"notification_foreground",
-                                               messageType, @"messageType",
-                                               aps, @"aps", nil];
+                    // Keep the original payload (custom data keys) so that a tap on this
+                    // local copy delivers the same data as the remote notification.
+                    NSMutableDictionary *userInfo = [messageData mutableCopy];
+                    [userInfo setValue:@"true" forKey:@"notification_foreground"];
+                    [userInfo setValue:messageType forKey:@"messageType"];
+                    [userInfo setValue:aps forKey:@"aps"];
                     objNotificationContent.userInfo = userInfo;
 
                     UNTimeIntervalNotificationTrigger *trigger =
