@@ -105,6 +105,21 @@ static BOOL immediateMessagePayloadDelivery = NO;
 }
 
 /**
+ * Called by Cordova when the web view starts a new page load. Callback ids belong to the
+ * page that registered them and are invalid after a reload, so drop them: messages are
+ * queued until the new page calls onMessageReceived again (which flushes the queue).
+ */
+- (void)onReset {
+    if (self.notificationCallbackId != nil) {
+        [[FirebasexCorePlugin sharedInstance] _logMessage:@"onReset: page is reloading, dropping the onMessageReceived callback until it is registered again"];
+    }
+    self.notificationCallbackId = nil;
+    self.tokenRefreshCallbackId = nil;
+    self.apnsTokenRefreshCallbackId = nil;
+    self.openSettingsCallbackId = nil;
+}
+
+/**
  * Reads pn-actions.json from the app bundle and registers actionable
  * notification categories with UNUserNotificationCenter.
  *
@@ -262,6 +277,7 @@ static BOOL immediateMessagePayloadDelivery = NO;
 /** Registers a persistent callback for incoming push messages. Flushes any queued notifications immediately. */
 - (void)onMessageReceived:(CDVInvokedUrlCommand *)command {
     self.notificationCallbackId = command.callbackId;
+    [[FirebasexCorePlugin sharedInstance] _logMessage:[NSString stringWithFormat:@"onMessageReceived: callback %@ registered, %lu message(s) pending", command.callbackId, (unsigned long)[self.notificationStack count]]];
     [self sendPendingNotifications];
 }
 
@@ -668,6 +684,7 @@ static BOOL immediateMessagePayloadDelivery = NO;
     }
 
     if ([[CDVAppDelegate instance].applicationInBackground isEqual:@(YES)] && !immediateMessagePayloadDelivery) {
+        [[FirebasexCorePlugin sharedInstance] _logMessage:[NSString stringWithFormat:@"sendPendingNotifications: app in background, keeping %lu message(s) queued", (unsigned long)[self.notificationStack count]]];
         return;
     }
 
@@ -700,11 +717,15 @@ static BOOL immediateMessagePayloadDelivery = NO;
             [[FirebasexCorePlugin sharedInstance] _logMessage:@"Message handled by custom receiver"];
             return;
         }
-        if (self.notificationCallbackId != nil &&
-            ([[CDVAppDelegate instance].applicationInBackground isEqual:@(NO)] || immediateMessagePayloadDelivery)) {
+        // A nil applicationInBackground (lifecycle tracking not started) counts as foreground:
+        // delivering is better than queueing forever.
+        BOOL inBackground = [[CDVAppDelegate instance].applicationInBackground isEqual:@(YES)];
+        NSString *callbackId = self.notificationCallbackId;
+        if (callbackId != nil && (!inBackground || immediateMessagePayloadDelivery)) {
+            [[FirebasexCorePlugin sharedInstance] _logMessage:[NSString stringWithFormat:@"sendNotification: delivering to JS callback %@ (inBackground=%d)", callbackId, inBackground]];
             [[FirebasexCorePlugin sharedInstance] sendPluginDictionaryResultAndKeepCallback:userInfo
                                                                                    command:self.commandDelegate
-                                                                                callbackId:self.notificationCallbackId];
+                                                                                callbackId:callbackId];
         } else {
             if (!self.notificationStack) {
                 self.notificationStack = [[NSMutableArray alloc] init];
@@ -714,6 +735,7 @@ static BOOL immediateMessagePayloadDelivery = NO;
             if ([self.notificationStack count] >= kNotificationStackSize) {
                 [self.notificationStack removeLastObject];
             }
+            [[FirebasexCorePlugin sharedInstance] _logMessage:[NSString stringWithFormat:@"sendNotification: queued (callback registered=%d, inBackground=%d, immediateDelivery=%d), %lu pending", callbackId != nil, inBackground, immediateMessagePayloadDelivery, (unsigned long)[self.notificationStack count]]];
         }
     } @catch (NSException *exception) {
         [[FirebasexCorePlugin sharedInstance] handlePluginExceptionWithoutContext:exception];
