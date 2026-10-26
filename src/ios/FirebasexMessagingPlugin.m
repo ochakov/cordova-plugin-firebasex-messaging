@@ -48,6 +48,8 @@ static BOOL immediateMessagePayloadDelivery = NO;
 static NSString *const kDeliveredFingerprintsKey = @"FirebasexMessagingDeliveredFingerprints";
 /** How many fingerprints are kept. */
 static NSUInteger const kDeliveredFingerprintsLimit = 200;
+/** NSUserDefaults key holding the messages queued for JS, so they survive the app being terminated in the background. */
+static NSString *const kPendingNotificationsKey = @"FirebasexMessagingPendingNotifications";
 
 + (FirebasexMessagingPlugin *)instance {
     return messagingInstance;
@@ -82,6 +84,14 @@ static NSUInteger const kDeliveredFingerprintsLimit = 200;
         if ([appDelegate isKindOfClass:[CDVAppDelegate class]]) {
             [(CDVAppDelegate *)appDelegate firebasexCoreEnsureLaunched];
             [(CDVAppDelegate *)appDelegate firebasexMessagingSetup];
+        }
+
+        // Restore messages that were queued (app in background, no JS callback yet) before the
+        // app was terminated; they are delivered once a callback is registered in the foreground.
+        NSArray *persisted = [[NSUserDefaults standardUserDefaults] arrayForKey:kPendingNotificationsKey];
+        if (persisted.count > 0) {
+            self.notificationStack = [persisted mutableCopy];
+            NSLog(@"%@ restored %lu queued message(s) from a previous run", LOG_TAG, (unsigned long)persisted.count);
         }
 
         // Set actionable categories if pn-actions.json exist in bundle
@@ -677,6 +687,23 @@ static NSUInteger const kDeliveredFingerprintsLimit = 200;
     [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
 }
 
+#pragma mark - Queue persistence
+
+/** Writes the queued messages to NSUserDefaults so they survive a termination while in the background. */
+- (void)persistPendingNotifications {
+    NSArray *stack = [self.notificationStack copy] ?: @[];
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    if (stack.count == 0) {
+        [defaults removeObjectForKey:kPendingNotificationsKey];
+        return;
+    }
+    if ([NSPropertyListSerialization propertyList:stack isValidForFormat:NSPropertyListBinaryFormat_v1_0]) {
+        [defaults setObject:stack forKey:kPendingNotificationsKey];
+    } else {
+        NSLog(@"%@ queued messages contain non-property-list values and are kept in memory only", LOG_TAG);
+    }
+}
+
 #pragma mark - Notification Center catch-up
 
 /**
@@ -773,6 +800,8 @@ static NSUInteger const kDeliveredFingerprintsLimit = 200;
     @try {
         NSArray *pendingNotifications = [self.notificationStack copy];
         [self.notificationStack removeAllObjects];
+        [self persistPendingNotifications];
+        [[FirebasexCorePlugin sharedInstance] _logMessage:[NSString stringWithFormat:@"sendPendingNotifications: delivering %lu queued message(s)", (unsigned long)pendingNotifications.count]];
 
         for (NSDictionary *userInfo in pendingNotifications) {
             [self sendNotification:userInfo];
@@ -815,9 +844,10 @@ static NSUInteger const kDeliveredFingerprintsLimit = 200;
             }
             [self.notificationStack addObject:userInfo];
 
-            if ([self.notificationStack count] >= kNotificationStackSize) {
-                [self.notificationStack removeLastObject];
+            while ([self.notificationStack count] > kNotificationStackSize) {
+                [self.notificationStack removeObjectAtIndex:0]; // drop the oldest, not the one just queued
             }
+            [self persistPendingNotifications];
             [[FirebasexCorePlugin sharedInstance] _logMessage:[NSString stringWithFormat:@"sendNotification: queued (callback registered=%d, inBackground=%d, immediateDelivery=%d), %lu pending", callbackId != nil, inBackground, immediateMessagePayloadDelivery, (unsigned long)[self.notificationStack count]]];
         }
     } @catch (NSException *exception) {
