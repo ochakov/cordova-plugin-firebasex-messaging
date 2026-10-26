@@ -137,15 +137,20 @@ static BOOL messagingSetupDone = NO;
     didReceiveRemoteNotification:(NSDictionary *)userInfo
           fetchCompletionHandler:(void (^)(UIBackgroundFetchResult))completionHandler {
 
-    if (![self firebasexMessagingIsFCMEnabled]) return;
+    NSLog(@"FirebasexMessaging[native] application:didReceiveRemoteNotification:fetchCompletionHandler: called (inBackground=%@)", self.applicationInBackground);
+    if (![self firebasexMessagingIsFCMEnabled]) {
+        completionHandler(UIBackgroundFetchResultNoData);
+        return;
+    }
 
     @try {
         [[FIRMessaging messaging] appDidReceiveMessage:userInfo];
         NSMutableDictionary *mutableInfo = [userInfo mutableCopy];
         NSDictionary *aps = [mutableInfo objectForKey:@"aps"];
         bool isContentAvailable = [self firebasexMessagingIsContentAvailable:userInfo];
+        bool hasAlert = [aps objectForKey:@"alert"] != nil;
 
-        if ([aps objectForKey:@"alert"] != nil) {
+        if (hasAlert) {
             [mutableInfo setValue:@"notification" forKey:@"messageType"];
             NSString *tap;
             if ([self.applicationInBackground isEqual:[NSNumber numberWithBool:YES]] && !isContentAvailable) {
@@ -166,8 +171,14 @@ static BOOL messagingSetupDone = NO;
             [self firebasexMessagingProcessMessageForForegroundNotification:mutableInfo];
         }
 
-        if ([self.applicationInBackground isEqual:[NSNumber numberWithBool:YES]] || !isContentAvailable) {
+        // In the foreground a content-available push that also has an alert is delivered by
+        // willPresentNotification (so it is not sent twice from here). A content-available push
+        // without an alert never reaches willPresentNotification, so it must be sent from here
+        // in the foreground too, otherwise it is lost.
+        if ([self.applicationInBackground isEqual:[NSNumber numberWithBool:YES]] || !isContentAvailable || !hasAlert) {
             [[FirebasexMessagingPlugin instance] sendNotification:mutableInfo];
+        } else {
+            [[FirebasexCorePlugin sharedInstance] _logMessage:@"didReceiveRemoteNotification: foreground content-available push with alert, delivered by willPresentNotification"];
         }
     } @catch (NSException *exception) {
         [[FirebasexCorePlugin sharedInstance] handlePluginExceptionWithoutContext:exception];
