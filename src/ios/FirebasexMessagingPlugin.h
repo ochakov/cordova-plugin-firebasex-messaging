@@ -35,6 +35,8 @@
 
 /** Delivers any queued notifications to the JavaScript callback. */
 - (void)sendPendingNotifications;
+/** Delivers remote pushes still in Notification Center that were never handed to JavaScript (app not woken). */
+- (void)deliverNotificationsFromNotificationCenter;
 /**
  * Delivers a notification to the JavaScript callback, or queues it if no callback is registered.
  * @param userInfo The notification payload dictionary.

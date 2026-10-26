@@ -44,6 +44,10 @@ static BOOL registeredForRemoteNotifications = NO;
 static BOOL openSettingsEmitted = NO;
 /** Whether incoming messages should be delivered to JS immediately even when backgrounded. */
 static BOOL immediateMessagePayloadDelivery = NO;
+/** NSUserDefaults key holding the fingerprints of payloads already handed to JS (or queued for it). */
+static NSString *const kDeliveredFingerprintsKey = @"FirebasexMessagingDeliveredFingerprints";
+/** How many fingerprints are kept. */
+static NSUInteger const kDeliveredFingerprintsLimit = 200;
 
 + (FirebasexMessagingPlugin *)instance {
     return messagingInstance;
@@ -99,9 +103,10 @@ static BOOL immediateMessagePayloadDelivery = NO;
     }
 }
 
-/** Called when the app becomes active; flushes any queued notifications. */
+/** Called when the app becomes active; flushes any queued notifications and picks up pushes the app was not woken for. */
 - (void)onAppDidBecomeActive {
     [self sendPendingNotifications];
+    [self deliverNotificationsFromNotificationCenter];
 }
 
 /**
@@ -279,6 +284,7 @@ static BOOL immediateMessagePayloadDelivery = NO;
     self.notificationCallbackId = command.callbackId;
     [[FirebasexCorePlugin sharedInstance] _logMessage:[NSString stringWithFormat:@"onMessageReceived: callback %@ registered, %lu message(s) pending", command.callbackId, (unsigned long)[self.notificationStack count]]];
     [self sendPendingNotifications];
+    [self deliverNotificationsFromNotificationCenter];
 }
 
 /**
@@ -671,6 +677,82 @@ static BOOL immediateMessagePayloadDelivery = NO;
     [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
 }
 
+#pragma mark - Notification Center catch-up
+
+/**
+ * Delivers to JS every remote push that is still in Notification Center and has not been handed
+ * to JS yet. iOS wakes a suspended app for a content-available push only on a budget (and never
+ * after a force quit, with Background App Refresh off or in Low Power Mode), so a push that showed
+ * a banner may never have reached application:didReceiveRemoteNotification:. Its full payload is
+ * still available from the delivered notifications, so it is picked up here when the app becomes
+ * active or when onMessageReceived is registered, without the user tapping the banner.
+ * Pushes without an alert never enter Notification Center and cannot be recovered this way.
+ */
+- (void)deliverNotificationsFromNotificationCenter {
+    if (!self.isFCMEnabled || self.notificationCallbackId == nil) {
+        return;
+    }
+    [[UNUserNotificationCenter currentNotificationCenter] getDeliveredNotificationsWithCompletionHandler:^(NSArray<UNNotification *> *notifications) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            @try {
+                NSUInteger delivered = 0;
+                for (UNNotification *notification in notifications) {
+                    if (![notification.request.trigger isKindOfClass:UNPushNotificationTrigger.class]) {
+                        continue; // local notifications (ours or other plugins') are not pushes
+                    }
+                    NSDictionary *userInfo = notification.request.content.userInfo;
+                    if (userInfo.count == 0 || [self wasDelivered:userInfo]) {
+                        continue;
+                    }
+                    NSMutableDictionary *info = [userInfo mutableCopy];
+                    NSDictionary *aps = [info objectForKey:@"aps"];
+                    [info setValue:([aps objectForKey:@"alert"] != nil ? @"notification" : @"data") forKey:@"messageType"];
+                    [info setValue:@"notification_center" forKey:@"delivery"];
+                    [self sendNotification:info];
+                    delivered++;
+                }
+                if (delivered > 0) {
+                    [[FirebasexCorePlugin sharedInstance] _logMessage:[NSString stringWithFormat:@"deliverNotificationsFromNotificationCenter: %lu push(es) found in Notification Center that the app had not received", (unsigned long)delivered]];
+                }
+            } @catch (NSException *exception) {
+                [[FirebasexCorePlugin sharedInstance] handlePluginExceptionWithoutContext:exception];
+            }
+        });
+    }];
+}
+
+/** Stable fingerprint of a payload, ignoring the keys this plugin adds on delivery. */
+- (NSString *)fingerprintForPayload:(NSDictionary *)userInfo {
+    NSMutableDictionary *payload = [userInfo mutableCopy];
+    for (NSString *key in @[@"messageType", @"tap", @"action", @"delivery"]) {
+        [payload removeObjectForKey:key];
+    }
+    if ([NSJSONSerialization isValidJSONObject:payload]) {
+        NSData *json = [NSJSONSerialization dataWithJSONObject:payload options:NSJSONWritingSortedKeys error:nil];
+        if (json) {
+            return [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding];
+        }
+    }
+    return [payload description];
+}
+
+- (BOOL)wasDelivered:(NSDictionary *)userInfo {
+    NSArray *fingerprints = [[NSUserDefaults standardUserDefaults] arrayForKey:kDeliveredFingerprintsKey];
+    return [fingerprints containsObject:[self fingerprintForPayload:userInfo]];
+}
+
+- (void)rememberDelivered:(NSDictionary *)userInfo {
+    NSString *fingerprint = [self fingerprintForPayload:userInfo];
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSMutableArray *fingerprints = [[defaults arrayForKey:kDeliveredFingerprintsKey] mutableCopy] ?: [NSMutableArray array];
+    [fingerprints removeObject:fingerprint];
+    [fingerprints addObject:fingerprint];
+    while (fingerprints.count > kDeliveredFingerprintsLimit) {
+        [fingerprints removeObjectAtIndex:0];
+    }
+    [defaults setObject:fingerprints forKey:kDeliveredFingerprintsKey];
+}
+
 #pragma mark - Message Delivery Internal
 
 /**
@@ -717,6 +799,7 @@ static BOOL immediateMessagePayloadDelivery = NO;
             [[FirebasexCorePlugin sharedInstance] _logMessage:@"Message handled by custom receiver"];
             return;
         }
+        [self rememberDelivered:userInfo];
         // A nil applicationInBackground (lifecycle tracking not started) counts as foreground:
         // delivering is better than queueing forever.
         BOOL inBackground = [[CDVAppDelegate instance].applicationInBackground isEqual:@(YES)];

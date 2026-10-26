@@ -1,3 +1,8 @@
+# Fork (ochakov)
+- (ios) cordova-ios 8: install the notification delegates from `pluginInitialize` when the launch swizzle was bypassed; keep the custom keys in the `notification_foreground` local copy.
+- (ios) Log every delivery decision (`sendNotification: delivering …` / `queued …`) to the device log and the web console; drop stale JS callbacks on page reload (`onReset`).
+- (ios) Catch-up delivery: when the app becomes active or `onMessageReceived` is registered, every remote push still in Notification Center that was never handed to JS (iOS did not wake the app for its `content-available`) is delivered with `delivery: "notification_center"`, without a tap. Payload fingerprints are remembered (200, in NSUserDefaults) so nothing is delivered twice.
+
 # Version 2.0.3
 - fix: pin core plugin dependency to v2
 - (ios) Resolve pending notification issues
