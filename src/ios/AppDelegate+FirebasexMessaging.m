@@ -137,12 +137,14 @@ static BOOL messagingSetupDone = NO;
     didReceiveRemoteNotification:(NSDictionary *)userInfo
           fetchCompletionHandler:(void (^)(UIBackgroundFetchResult))completionHandler {
 
-    NSLog(@"FirebasexMessaging[native] application:didReceiveRemoteNotification:fetchCompletionHandler: called (inBackground=%@)", self.applicationInBackground);
+    NSLog(@"FirebasexMessaging[native] application:didReceiveRemoteNotification:fetchCompletionHandler: called (inBackground=%@, pluginInstance=%@)",
+          self.applicationInBackground, [FirebasexMessagingPlugin instance] != nil ? @"yes" : @"no");
     if (![self firebasexMessagingIsFCMEnabled]) {
         completionHandler(UIBackgroundFetchResultNoData);
         return;
     }
 
+    UIBackgroundFetchResult result = UIBackgroundFetchResultFailed;
     @try {
         [[FIRMessaging messaging] appDidReceiveMessage:userInfo];
         NSMutableDictionary *mutableInfo = [userInfo mutableCopy];
@@ -163,8 +165,6 @@ static BOOL messagingSetupDone = NO;
 
         [[FirebasexCorePlugin sharedInstance] _logMessage:[NSString stringWithFormat:@"didReceiveRemoteNotification: %@", mutableInfo]];
 
-        completionHandler(UIBackgroundFetchResultNewData);
-
         if ([self.applicationInBackground isEqual:[NSNumber numberWithBool:YES]] && isContentAvailable) {
             [[FirebasexCorePlugin sharedInstance] _logError:@"didReceiveRemoteNotification: omitting foreground notification as content-available:1 so system notification will be shown"];
         } else {
@@ -176,12 +176,38 @@ static BOOL messagingSetupDone = NO;
         // without an alert never reaches willPresentNotification, so it must be sent from here
         // in the foreground too, otherwise it is lost.
         if ([self.applicationInBackground isEqual:[NSNumber numberWithBool:YES]] || !isContentAvailable || !hasAlert) {
-            [[FirebasexMessagingPlugin instance] sendNotification:mutableInfo];
+            [self firebasexMessagingHandOverToPlugin:mutableInfo];
         } else {
             [[FirebasexCorePlugin sharedInstance] _logMessage:@"didReceiveRemoteNotification: foreground content-available push with alert, delivered by willPresentNotification"];
         }
+        result = UIBackgroundFetchResultNewData;
     } @catch (NSException *exception) {
+        // The core plugin has no instance in a background launch, so log here as well.
+        NSLog(@"FirebasexMessaging[native] ERROR: exception in didReceiveRemoteNotification: %@", exception.reason);
         [[FirebasexCorePlugin sharedInstance] handlePluginExceptionWithoutContext:exception];
+    }
+
+    // Called last, once the payload has been delivered or persisted: iOS may suspend the app
+    // (or, after a background launch, let it be terminated) as soon as the handler completes.
+    completionHandler(result);
+}
+
+/**
+ * Hands a payload to the plugin, or persists it when no plugin exists yet.
+ *
+ * cordova-ios 8 creates the plugins from CDVViewController's viewDidLoad, which runs once a
+ * scene connects. iOS connects no scene when it launches a terminated app in the background
+ * for a content-available push (and the scene of a notification-tap launch may connect after
+ * the response is delivered), so [FirebasexMessagingPlugin instance] is nil there and a
+ * message sent to it would be dropped silently. The payload is persisted instead and restored
+ * by pluginInitialize at the next launch.
+ */
+- (void)firebasexMessagingHandOverToPlugin:(NSDictionary *)userInfo {
+    FirebasexMessagingPlugin *plugin = [FirebasexMessagingPlugin instance];
+    if (plugin != nil) {
+        [plugin sendNotification:userInfo];
+    } else {
+        [FirebasexMessagingPlugin queueNotificationForNextLaunch:userInfo];
     }
 }
 
@@ -356,7 +382,7 @@ static BOOL messagingSetupDone = NO;
         }
 
         if (![messageType isEqualToString:@"data"]) {
-            [[FirebasexMessagingPlugin instance] sendNotification:mutableInfo];
+            [self firebasexMessagingHandOverToPlugin:mutableInfo];
         }
     } @catch (NSException *exception) {
         [[FirebasexCorePlugin sharedInstance] handlePluginExceptionWithoutContext:exception];
@@ -408,7 +434,7 @@ static BOOL messagingSetupDone = NO;
         }
 
         [[FirebasexCorePlugin sharedInstance] _logInfo:[NSString stringWithFormat:@"didReceiveNotificationResponse: %@", mutableInfo]];
-        [[FirebasexMessagingPlugin instance] sendNotification:mutableInfo];
+        [self firebasexMessagingHandOverToPlugin:mutableInfo];
         completionHandler();
     } @catch (NSException *exception) {
         [[FirebasexCorePlugin sharedInstance] handlePluginExceptionWithoutContext:exception];

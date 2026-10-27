@@ -21,6 +21,15 @@
 @import FirebaseMessaging;
 @import UserNotifications;
 
+@interface FirebasexMessagingPlugin ()
+/** Stable fingerprint of a payload, ignoring the keys this plugin adds on delivery. */
++ (NSString *)fingerprintForPayload:(NSDictionary *)userInfo;
+/** Whether a payload with this fingerprint was already handed to JS or queued for it. */
++ (BOOL)wasDelivered:(NSDictionary *)userInfo;
+/** Records a payload as handed to JS or queued for it. */
++ (void)rememberDelivered:(NSDictionary *)userInfo;
+@end
+
 @implementation FirebasexMessagingPlugin
 
 @synthesize openSettingsCallbackId;
@@ -689,19 +698,75 @@ static NSString *const kPendingNotificationsKey = @"FirebasexMessagingPendingNot
 
 #pragma mark - Queue persistence
 
-/** Writes the queued messages to NSUserDefaults so they survive a termination while in the background. */
-- (void)persistPendingNotifications {
-    NSArray *stack = [self.notificationStack copy] ?: @[];
+/**
+ * Returns a copy of a payload value that NSUserDefaults can store: NSNull entries are dropped
+ * and any other non-property-list object is replaced by its description. APNs payloads are
+ * JSON, so in practice only a JSON null needs this.
+ */
+static id FirebasexMessagingPropertyListValue(id value) {
+    if ([value isKindOfClass:[NSDictionary class]]) {
+        NSMutableDictionary *copy = [NSMutableDictionary dictionaryWithCapacity:[(NSDictionary *)value count]];
+        [(NSDictionary *)value enumerateKeysAndObjectsUsingBlock:^(id key, id obj, BOOL *stop) {
+            id converted = FirebasexMessagingPropertyListValue(obj);
+            if (converted != nil) {
+                copy[[key isKindOfClass:[NSString class]] ? key : [key description]] = converted;
+            }
+        }];
+        return copy;
+    }
+    if ([value isKindOfClass:[NSArray class]]) {
+        NSMutableArray *copy = [NSMutableArray arrayWithCapacity:[(NSArray *)value count]];
+        for (id obj in (NSArray *)value) {
+            id converted = FirebasexMessagingPropertyListValue(obj);
+            if (converted != nil) {
+                [copy addObject:converted];
+            }
+        }
+        return copy;
+    }
+    if ([value isKindOfClass:[NSString class]] || [value isKindOfClass:[NSNumber class]] ||
+        [value isKindOfClass:[NSDate class]] || [value isKindOfClass:[NSData class]]) {
+        return value;
+    }
+    if (value == nil || [value isKindOfClass:[NSNull class]]) {
+        return nil;
+    }
+    return [value description];
+}
+
+/** Writes a queue to NSUserDefaults; an empty queue removes the key. */
+static void FirebasexMessagingWritePendingQueue(NSArray *stack) {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     if (stack.count == 0) {
         [defaults removeObjectForKey:kPendingNotificationsKey];
-        return;
-    }
-    if ([NSPropertyListSerialization propertyList:stack isValidForFormat:NSPropertyListBinaryFormat_v1_0]) {
-        [defaults setObject:stack forKey:kPendingNotificationsKey];
     } else {
-        NSLog(@"%@ queued messages contain non-property-list values and are kept in memory only", LOG_TAG);
+        [defaults setObject:FirebasexMessagingPropertyListValue(stack) forKey:kPendingNotificationsKey];
     }
+}
+
+/** Writes the queued messages to NSUserDefaults so they survive a termination while in the background. */
+- (void)persistPendingNotifications {
+    FirebasexMessagingWritePendingQueue([self.notificationStack copy] ?: @[]);
+}
+
+/**
+ * Queues a message without a plugin instance.
+ *
+ * cordova-ios 8 creates the plugins from CDVViewController's viewDidLoad, which runs once a
+ * scene connects, and iOS connects no scene when it launches a terminated app in the background
+ * for a content-available push. The app delegate category then has no plugin to hand the
+ * payload to, so it goes straight into the persisted queue that pluginInitialize restores at
+ * the next (foreground) launch.
+ */
++ (void)queueNotificationForNextLaunch:(NSDictionary *)userInfo {
+    [self rememberDelivered:userInfo];
+    NSMutableArray *stack = [[[NSUserDefaults standardUserDefaults] arrayForKey:kPendingNotificationsKey] mutableCopy] ?: [NSMutableArray array];
+    [stack addObject:userInfo];
+    while (stack.count > kNotificationStackSize) {
+        [stack removeObjectAtIndex:0]; // drop the oldest, not the one just queued
+    }
+    FirebasexMessagingWritePendingQueue(stack);
+    NSLog(@"%@ queueNotificationForNextLaunch: no plugin instance (app launched in the background, no scene), %lu message(s) persisted for the next launch", LOG_TAG, (unsigned long)stack.count);
 }
 
 #pragma mark - Notification Center catch-up
@@ -728,7 +793,7 @@ static NSString *const kPendingNotificationsKey = @"FirebasexMessagingPendingNot
                         continue; // local notifications (ours or other plugins') are not pushes
                     }
                     NSDictionary *userInfo = notification.request.content.userInfo;
-                    if (userInfo.count == 0 || [self wasDelivered:userInfo]) {
+                    if (userInfo.count == 0 || [FirebasexMessagingPlugin wasDelivered:userInfo]) {
                         continue;
                     }
                     NSMutableDictionary *info = [userInfo mutableCopy];
@@ -749,7 +814,7 @@ static NSString *const kPendingNotificationsKey = @"FirebasexMessagingPendingNot
 }
 
 /** Stable fingerprint of a payload, ignoring the keys this plugin adds on delivery. */
-- (NSString *)fingerprintForPayload:(NSDictionary *)userInfo {
++ (NSString *)fingerprintForPayload:(NSDictionary *)userInfo {
     NSMutableDictionary *payload = [userInfo mutableCopy];
     for (NSString *key in @[@"messageType", @"tap", @"action", @"delivery"]) {
         [payload removeObjectForKey:key];
@@ -763,12 +828,12 @@ static NSString *const kPendingNotificationsKey = @"FirebasexMessagingPendingNot
     return [payload description];
 }
 
-- (BOOL)wasDelivered:(NSDictionary *)userInfo {
++ (BOOL)wasDelivered:(NSDictionary *)userInfo {
     NSArray *fingerprints = [[NSUserDefaults standardUserDefaults] arrayForKey:kDeliveredFingerprintsKey];
     return [fingerprints containsObject:[self fingerprintForPayload:userInfo]];
 }
 
-- (void)rememberDelivered:(NSDictionary *)userInfo {
++ (void)rememberDelivered:(NSDictionary *)userInfo {
     NSString *fingerprint = [self fingerprintForPayload:userInfo];
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     NSMutableArray *fingerprints = [[defaults arrayForKey:kDeliveredFingerprintsKey] mutableCopy] ?: [NSMutableArray array];
@@ -828,7 +893,7 @@ static NSString *const kPendingNotificationsKey = @"FirebasexMessagingPendingNot
             [[FirebasexCorePlugin sharedInstance] _logMessage:@"Message handled by custom receiver"];
             return;
         }
-        [self rememberDelivered:userInfo];
+        [FirebasexMessagingPlugin rememberDelivered:userInfo];
         // A nil applicationInBackground (lifecycle tracking not started) counts as foreground:
         // delivering is better than queueing forever.
         BOOL inBackground = [[CDVAppDelegate instance].applicationInBackground isEqual:@(YES)];
